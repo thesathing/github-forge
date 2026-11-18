@@ -4,7 +4,7 @@
 
 import {
   VIEWER, createIssue, createPull, diffFiles, getRepo, isoTs, mergePull, addComment,
-  pullConflicts, resolveRef, type Issue, type Pull, type Repo,
+  pullConflicts, resolveRef, touchIssue, type Issue, type Pull, type Repo,
 } from './store.ts';
 import { parseCommit, parseTree } from './gitcore.ts';
 
@@ -623,6 +623,7 @@ function executeMutation(field: FieldNode, state: ExecState): unknown {
       if (!found) return { issue: null };
       found.issue.state = 'closed';
       found.issue.updatedTs = found.issue.updatedTs; // keep deterministic
+      touchIssue(found.issue);
       return { issue: issueNode(found.repo, found.issue) };
     }
     case 'createPullRequest': {
