@@ -21,7 +21,12 @@ export interface Issue {
   state: 'open' | 'closed'; labels: Label[]; seq: number;
   createdTs: number; updatedTs: number;
   comments: { id: number; body: string; createdTs: number }[];
+  /** Bumped on every mutation; lets the HTTP layer cache the serialized body. */
+  version: number;
 }
+
+/** Bump an issue's version after mutating it (invalidates its cached JSON body). */
+export function touchIssue(issue: Issue): void { issue.version += 1; }
 export interface Pull {
   readonly id: number; number: number; title: string; body: string;
   state: 'open' | 'closed'; merged: boolean; mergedAt: string | null; mergeCommitSha: string | null;
@@ -183,7 +188,7 @@ export function createIssue(repo: Repo, title: string, body = '', labelNames: re
   const ts = nextTs();
   const issue: Issue = {
     id: ++issueSeq, number: repo.nextIssue++, title, body, state: 'open', labels,
-    seq: repo.nextIssue, createdTs: ts, updatedTs: ts, comments: [],
+    seq: repo.nextIssue, createdTs: ts, updatedTs: ts, comments: [], version: 1,
   };
   repo.issues.push(issue);
   repo.issuesByNumber.set(issue.number, issue);
@@ -195,6 +200,7 @@ export function addComment(repo: Repo, issueNumber: number, body: string): { id:
   if (!issue) return undefined;
   const comment = { id: ++commentSeq, body, createdTs: nextTs() };
   issue.comments.push(comment);
+  touchIssue(issue);
   return comment;
 }
 
@@ -336,7 +342,7 @@ export function listCommits(repo: Repo, ref: string, limit = 30): { sha: string;
 
 // ---------------------------------------------------------------- git fetch planning
 
-export interface FetchPlan { objects: GitObject[]; shallow: string[]; unshallow: string[]; }
+export interface FetchPlan { objects: Array<GitObject & { oid: string }>; shallow: string[]; unshallow: string[]; }
 
 /**
  * Plan a fetch: objects to send for `wants` (with optional shallow depth), minus what the
@@ -359,11 +365,11 @@ export function planFetch(repo: Repo, wants: readonly string[], haves: readonly 
       for (const oid of closure(haves, lookupFn)) held.add(oid);
     }
   }
-  const objects: GitObject[] = [];
+  const objects: Array<GitObject & { oid: string }> = [];
   for (const oid of wanted.objects) {
     if (held.has(oid)) continue;
     const obj = repo.objects.get(oid);
-    if (obj) objects.push(obj);
+    if (obj) objects.push({ ...obj, oid });
   }
   // Unshallow: an old boundary whose parents are now included in the walk.
   const unshallow: string[] = [];
