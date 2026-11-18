@@ -324,8 +324,9 @@ function deflateCached(oid: string, data: Buffer): Buffer {
   return out;
 }
 
-/** Build a plain-object packfile (no deltas). */
-export function writePack(objects: Iterable<GitObject>): Buffer {
+/** Build a plain-object packfile (no deltas). Objects may carry their oid (the
+ *  fetch planner already knows it) so the packer skips re-hashing every object. */
+export function writePack(objects: Iterable<GitObject & { oid?: string }>): Buffer {
   const list = [...objects];
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
@@ -335,12 +336,16 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   parts.push(header);
   for (const o of list) {
     parts.push(writePackObjectHeader(o.type, o.data.length));
-    // GitObject carries no oid (the map key is the oid); derive it from content —
-    // the cache key is then correct by construction.
-    parts.push(deflateCached(hashObject(o.type, o.data), o.data));
+    // The oid is the deflate-cache key; hashing the content again would be pure waste.
+    parts.push(deflateCached(o.oid ?? hashObject(o.type, o.data), o.data));
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  // Single allocation for body + trailing SHA-1 instead of two Buffer.concats.
+  const bodyLen = parts.reduce((sum, p) => sum + p.length, 0);
+  const out = Buffer.allocUnsafe(bodyLen + 20);
+  let off = 0;
+  for (const p of parts) { p.copy(out, off); off += p.length; }
+  createHash('sha1').update(out.subarray(0, bodyLen)).digest().copy(out, bodyLen);
+  return out;
 }
 
 export function packChecksumOk(pack: Uint8Array): boolean {
