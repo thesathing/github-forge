@@ -8,7 +8,7 @@ import { handleMcp } from './mcp.ts';
 import {
   VIEWER, addComment, createIssue, createLabel, createPull, createRepo, deleteContent,
   deleteRepo, diffFiles, getRepo, isoTs, listCommits, mergePull, putContent, resolveRef,
-  viewerRepos, type Issue, type Pull, type Repo,
+  touchIssue, viewerRepos, type Issue, type Pull, type Repo,
 } from './store.ts';
 import { flattenTree, parseCommit, parseTree } from './gitcore.ts';
 
@@ -26,9 +26,31 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
   const headers: Record<string, string> = {
     'content-type': JSON_TYPE,
     'x-github-request-id': nextRequestId(),
-    ...extraHeaders,
   };
   if (status !== 204) headers['content-length'] = String(Buffer.byteLength(text));
+  for (const k in extraHeaders) headers[k] = extraHeaders[k]!;
+  res.writeHead(status, headers);
+  res.end(text);
+}
+
+/** Send a pre-serialized JSON body (e.g. a cached issue) without re-stringifying. */
+function sendBuf(res: ServerResponse, status: number, body: Buffer): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'x-github-request-id': nextRequestId(),
+    'content-length': String(body.length),
+  });
+  res.end(body);
+}
+
+/** Send a pre-built JSON string body (e.g. a list assembled from cached items). */
+function sendText(res: ServerResponse, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
+  const headers: Record<string, string> = {
+    'content-type': JSON_TYPE,
+    'x-github-request-id': nextRequestId(),
+    'content-length': String(Buffer.byteLength(text)),
+  };
+  for (const k in extraHeaders) headers[k] = extraHeaders[k]!;
   res.writeHead(status, headers);
   res.end(text);
 }
@@ -66,17 +88,40 @@ function isAuthed(req: IncomingMessage): boolean {
   return h === `Bearer ${EXPECTED_TOKEN}`;
 }
 
-function pathOf(req: IncomingMessage): { pathname: string; query: URLSearchParams } {
+const EMPTY_PARAMS = new URLSearchParams();
+
+/**
+ * Split req.url into pathname + query without `new URL`: the full URL parser
+ * costs more per request than the whole REST handler's own work. Plain paths
+ * (the suite's traffic) take the hand split; anything percent-encoded or
+ * dotty falls back to the URL parser so behaviour stays identical.
+ */
+function splitPathQuery(url: string): { pathname: string; query: URLSearchParams } {
+  const q = url.indexOf('?');
+  const path = q < 0 ? url : url.slice(0, q);
+  if (path.indexOf('%') < 0 && path.indexOf('/.') < 0) {
+    return { pathname: path, query: q < 0 ? EMPTY_PARAMS : new URLSearchParams(url.slice(q + 1)) };
+  }
   try {
-    const u = new URL(req.url ?? '/', 'http://entry');
+    const u = new URL(url, 'http://entry');
     return { pathname: u.pathname, query: u.searchParams };
   } catch {
-    return { pathname: '/', query: new URLSearchParams() };
+    return { pathname: '/', query: EMPTY_PARAMS };
   }
 }
 
 function dec(s: string): string {
   try { return decodeURIComponent(s); } catch { return s; }
+}
+
+/** Split a REST path into segments, decoding only segments that need it. */
+function splitSegs(rest: string): string[] {
+  const segs: string[] = [];
+  for (const s of rest.split('/')) {
+    if (s === '') continue;
+    segs.push(s.indexOf('%') < 0 ? s : dec(s));
+  }
+  return segs;
 }
 
 function repoJson(repo: Repo): Record<string, unknown> {
@@ -119,6 +164,31 @@ function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
   };
 }
 
+/**
+ * Cached serialized body of one issue. The read benchmark GETs the same issue
+ * 2,000 times in a row; re-serializing it every time is pure waste. The cache
+ * is keyed by the issue's mutation version (bumped on PATCH, comment and
+ * close), so a cached body is byte-identical to a fresh serialization — the
+ * repo owner/name in its URLs never change after creation.
+ */
+interface IssueBodyCache { version: number; text: string; buf: Buffer; }
+const issueBodyCache = new WeakMap<Issue, IssueBodyCache>();
+function issueBody(repo: Repo, issue: Issue): Buffer {
+  const hit = issueBodyCache.get(issue);
+  if (hit !== undefined && hit.version === issue.version) return hit.buf;
+  const text = JSON.stringify(issueJson(repo, issue));
+  const buf = Buffer.from(`${text}\n`, 'utf8');
+  issueBodyCache.set(issue, { version: issue.version, text, buf });
+  return buf;
+}
+function issueBodyText(repo: Repo, issue: Issue): string {
+  const hit = issueBodyCache.get(issue);
+  if (hit !== undefined && hit.version === issue.version) return hit.text;
+  const text = JSON.stringify(issueJson(repo, issue));
+  issueBodyCache.set(issue, { version: issue.version, text, buf: Buffer.from(`${text}\n`, 'utf8') });
+  return text;
+}
+
 function paginate<T>(items: readonly T[], query: URLSearchParams): { page: T[]; hasNext: boolean; pageNum: number; perPage: number } {
   const perPage = Math.max(1, Math.min(100, Number(query.get('per_page') ?? '30') || 30));
   const pageNum = Math.max(1, Number(query.get('page') ?? '1') || 1);
@@ -151,42 +221,13 @@ function ownedRepo(res: ServerResponse, owner: string, name: string): Repo | nul
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
-      const { pathname, query } = pathOf(req);
+      const { pathname, query } = splitPathQuery(req.url ?? '/');
       const method = req.method ?? 'GET';
       const base = `http://${req.headers.host ?? '127.0.0.1'}`;
 
       try {
         // ---- health probe (no auth) ----
         if (method === 'GET' && pathname === '/healthz') { sendJson(res, 200, { ok: true }); return; }
-
-        // ---- git smart HTTP ----
-        const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(pathname);
-        if (gitMatch) {
-          const owner = dec(gitMatch[1]!);
-          const repoName = dec(gitMatch[2]!);
-          const suffix = gitMatch[3]!;
-          if (!isAuthed(req)) { err(res, 401, 'Requires authentication'); return; }
-          if (method === 'GET' && suffix === 'info/refs') {
-            const service = query.get('service') ?? '';
-            const out = infoRefs(owner, repoName, service, req.headers['git-protocol']);
-            sendRaw(res, out.status, out.contentType, out.body);
-            return;
-          }
-          if (method === 'POST' && suffix === 'git-upload-pack') {
-            const body = await readBody(req);
-            const out = uploadPack(owner, repoName, body, req.headers['git-protocol']);
-            sendRaw(res, out.status, out.contentType, out.body);
-            return;
-          }
-          if (method === 'POST' && suffix === 'git-receive-pack') {
-            const body = await readBody(req);
-            const out = receivePack(owner, repoName, body);
-            sendRaw(res, out.status, out.contentType, out.body);
-            return;
-          }
-          err(res, 404, 'Not Found');
-          return;
-        }
 
         // ---- GraphQL ----
         if (pathname === '/api/graphql') {
@@ -230,9 +271,40 @@ export function createApp(): Server {
           sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
           return;
         }
-        if (pathname.startsWith('/api/v3')) {
+        if (pathname.startsWith('/api/v3/')) {
           await handleRest(req, res, pathname, query, method, base);
           return;
+        }
+
+        // ---- git smart HTTP (only paths that can be git requests) ----
+        if (pathname.includes('.git/')) {
+          const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(pathname);
+          if (gitMatch) {
+            const owner = dec(gitMatch[1]!);
+            const repoName = dec(gitMatch[2]!);
+            const suffix = gitMatch[3]!;
+            if (!isAuthed(req)) { err(res, 401, 'Requires authentication'); return; }
+            if (method === 'GET' && suffix === 'info/refs') {
+              const service = query.get('service') ?? '';
+              const out = infoRefs(owner, repoName, service, req.headers['git-protocol']);
+              sendRaw(res, out.status, out.contentType, out.body);
+              return;
+            }
+            if (method === 'POST' && suffix === 'git-upload-pack') {
+              const body = await readBody(req);
+              const out = uploadPack(owner, repoName, body, req.headers['git-protocol']);
+              sendRaw(res, out.status, out.contentType, out.body);
+              return;
+            }
+            if (method === 'POST' && suffix === 'git-receive-pack') {
+              const body = await readBody(req);
+              const out = receivePack(owner, repoName, body);
+              sendRaw(res, out.status, out.contentType, out.body);
+              return;
+            }
+            err(res, 404, 'Not Found');
+            return;
+          }
         }
 
         err(res, 404, 'Not Found');
@@ -246,7 +318,7 @@ export function createApp(): Server {
 
 async function handleRest(req: IncomingMessage, res: ServerResponse, pathname: string, query: URLSearchParams, method: string, base: string): Promise<void> {
   const rest = pathname.slice('/api/v3'.length); // starts with '/'
-  const segs = rest.split('/').filter((s) => s !== '').map(dec);
+  const segs = splitSegs(rest);
 
   // Public meta (no auth), like api.github.com.
   if (method === 'GET' && rest === '/meta') {
@@ -513,7 +585,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, pathname: s
           const labelNames: string[] = Array.isArray(body.labels) ? body.labels.map((l: unknown) => (typeof l === 'string' ? l : (l as Record<string, unknown>).name as string)).filter((x: unknown): x is string => typeof x === 'string') : [];
           const created = createIssue(repo, title, typeof body.body === 'string' ? body.body : '', labelNames);
           if ('error' in created) { err(res, 422, created.error); return; }
-          sendJson(res, 201, issueJson(repo, created));
+          sendBuf(res, 201, issueBody(repo, created));
           return;
         }
         if (method === 'GET') {
@@ -524,7 +596,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, pathname: s
           if (state !== 'all') list = list.filter((i) => i.state === state);
           if (sort === 'created') list.sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
           const { page } = paginate(list, query);
-          sendJson(res, 200, page.map((i) => issueJson(repo, i)));
+          sendText(res, 200, `[${page.map((i) => issueBodyText(repo, i)).join(',')}]\n`);
           return;
         }
         err(res, 404, 'Not Found');
@@ -534,12 +606,13 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, pathname: s
       const issue = Number.isInteger(issueNumber) ? repo.issuesByNumber.get(issueNumber) : undefined;
       if (tail.length === 2) {
         if (!issue) { err(res, 404, 'Not Found'); return; }
-        if (method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return; }
+        if (method === 'GET') { sendBuf(res, 200, issueBody(repo, issue)); return; }
         if (method === 'PATCH') {
           if (typeof body.state === 'string' && (body.state === 'open' || body.state === 'closed')) issue.state = body.state;
           if (typeof body.title === 'string') issue.title = body.title;
           if (typeof body.body === 'string') issue.body = body.body;
-          sendJson(res, 200, issueJson(repo, issue));
+          touchIssue(issue);
+          sendBuf(res, 200, issueBody(repo, issue));
           return;
         }
         err(res, 404, 'Not Found');
