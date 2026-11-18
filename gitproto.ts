@@ -131,15 +131,19 @@ function parseV2Request(body: Buffer): { command: string; args: Map<string, stri
 }
 
 function sidebandChunk(pack: Buffer): Buffer {
-  const parts: Buffer[] = [];
+  // One buffer per chunk (header + band byte + data in a single alloc) instead of
+  // three copies: Buffer.concat([band, data]) -> pktLine copy -> final concat.
   const CHUNK = 32768;
-  for (let off = 0; off < pack.length; off += CHUNK) {
-    const data = pack.subarray(off, Math.min(pack.length, off + CHUNK));
-    const payload = Buffer.concat([Buffer.from([1]), data]);
-    parts.push(pktLine(payload));
-  }
-  if (pack.length === 0) {
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), Buffer.alloc(0)])));
+  const n = Math.max(1, Math.ceil(pack.length / CHUNK));
+  const parts: Buffer[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const off = i * CHUNK;
+    const dataLen = Math.min(CHUNK, pack.length - off);
+    const buf = Buffer.allocUnsafe(4 + 1 + dataLen);
+    buf.write((dataLen + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    buf[4] = 1;
+    pack.copy(buf, 5, off, off + dataLen);
+    parts[i] = buf;
   }
   return Buffer.concat(parts);
 }
